@@ -11,6 +11,13 @@ import re
 import time
 from datetime import datetime
 
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_SCRAPING = True
+except ImportError:
+    HAS_SCRAPING = False
+
 # ---------------------------------------------------------------------------
 # PAGE CONFIG
 # ---------------------------------------------------------------------------
@@ -522,38 +529,141 @@ def _call_google(system_prompt: str, user_message: str, model: str, api_key: str
     return response.text
 
 
+def _fetch_website_text(url: str, max_chars: int = 8000) -> str:
+    """Fetch and extract readable text from a URL."""
+    if not HAS_SCRAPING or not url:
+        return ""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Remove script, style, nav, footer noise
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "iframe"]):
+            tag.decompose()
+
+        text = soup.get_text(separator="\n", strip=True)
+        # Collapse multiple newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def _try_fetch_about_page(base_url: str) -> str:
+    """Try to find and fetch an about/story page for richer brand info."""
+    if not HAS_SCRAPING or not base_url:
+        return ""
+    about_paths = ["/pages/about", "/about", "/pages/story", "/story", "/our-story", "/about-us"]
+    base = base_url.rstrip("/")
+    for path in about_paths:
+        try:
+            text = _fetch_website_text(f"{base}{path}", max_chars=4000)
+            if len(text) > 200:  # Only return if we got meaningful content
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_json_response(text: str) -> dict | None:
+    """Robustly parse JSON from an LLM response, handling markdown fences and preamble."""
+    if not text:
+        return None
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    cleaned = re.sub(r'```(?:json)?\s*', '', text)
+    cleaned = cleaned.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting the first complete JSON object
+    try:
+        match = re.search(r'\{[\s\S]*\}', cleaned)
+        if match:
+            return json.loads(match.group())
+    except json.JSONDecodeError:
+        pass
+
+    # Try fixing common issues: trailing commas
+    try:
+        fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        match = re.search(r'\{[\s\S]*\}', fixed)
+        if match:
+            return json.loads(match.group())
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
 def scrape_brand_info(brand_name: str, url: str, category: str) -> dict:
-    """Use LLM to generate a brand profile based on web-scraped knowledge."""
-    system = """You are a brand research analyst. Given a brand name, URL, and category,
-provide a structured brand profile based on your knowledge. Return ONLY valid JSON with these fields:
+    """Research a brand by scraping its website and using LLM to structure the data."""
+
+    # --- Step 1: Try to scrape real website content ---
+    site_text = ""
+    about_text = ""
+    if url:
+        site_text = _fetch_website_text(url)
+        about_text = _try_fetch_about_page(url)
+
+    has_site_content = len(site_text) > 100
+
+    # --- Step 2: Build the LLM prompt based on what we have ---
+    system = """You are a brand research analyst. Your job is to produce a structured brand profile.
+Return ONLY a valid JSON object — no markdown fences, no commentary, no preamble. Just the raw JSON.
+The JSON must have exactly these fields:
 {
-    "tagline": "brand tagline or slogan if known, empty string if unknown",
+    "tagline": "brand tagline or slogan if found, empty string if unknown",
     "ethos": "1-2 sentence brand mission/ethos",
     "values": ["value1", "value2", "value3"],
-    "anti_positioning": "what the brand explicitly is NOT or avoids",
+    "anti_positioning": "what the brand explicitly is NOT or avoids being",
     "emotional_territory": "the core feeling/emotion the brand owns",
     "audience_description": "psychographic description of typical customer",
     "aesthetic_description": "visual style, color tendencies, design language",
     "price_tier": "budget / accessible / mid-range / premium / luxury",
     "notable_info": "any other relevant brand context",
-    "confidence": "high / medium / low — how well you know this brand"
+    "confidence": "high / medium / low"
 }
-If you don't know the brand, set confidence to 'low' and make reasonable inferences from the category."""
+CRITICAL: Return ONLY the JSON object. No other text before or after it."""
 
-    user_msg = f"Brand: {brand_name}\nWebsite: {url}\nCategory: {category}"
+    if has_site_content:
+        user_msg = f"""Analyze this brand and produce a structured profile.
+
+Brand: {brand_name}
+Website: {url}
+Category: {category}
+
+=== HOMEPAGE CONTENT ===
+{site_text[:5000]}
+
+=== ABOUT PAGE CONTENT ===
+{about_text[:3000] if about_text else 'Not found'}
+
+Use the website content above as your primary source. Extract the tagline, values, aesthetic, and audience from what you can see. Set confidence to 'high' if the site gave you clear brand signals, 'medium' if partial."""
+    else:
+        user_msg = f"""Analyze this brand and produce a structured profile based on your knowledge.
+
+Brand: {brand_name}
+Website: {url}
+Category: {category}
+
+If you know this brand, provide detailed information. If you don't recognize it, set confidence to 'low' and make reasonable inferences based on the category and name."""
+
     result = call_llm(system, user_msg, max_tokens=1024)
 
     if result.startswith("__LLM_"):
         return None
 
-    try:
-        # Extract JSON from response
-        json_match = re.search(r'\{[\s\S]*\}', result)
-        if json_match:
-            return json.loads(json_match.group())
-    except json.JSONDecodeError:
-        pass
-    return None
+    parsed = _parse_json_response(result)
+    return parsed
 
 
 def generate_narrative_concepts(brand_profile: dict) -> str:
@@ -1220,13 +1330,30 @@ def step_generate():
             ]
         else:
             try:
-                json_match = re.search(r'\[[\s\S]*\]', result)
+                # Strip markdown fences first
+                cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
+                # Try array extraction
+                json_match = re.search(r'\[[\s\S]*\]', cleaned)
                 if json_match:
                     st.session_state.generated_narratives = json.loads(json_match.group())
                 else:
-                    st.session_state.generated_narratives = "parse_error"
+                    # Maybe it returned a single object — wrap it
+                    parsed = _parse_json_response(cleaned)
+                    if parsed and isinstance(parsed, dict):
+                        st.session_state.generated_narratives = [parsed]
+                    else:
+                        st.session_state.generated_narratives = "parse_error"
             except json.JSONDecodeError:
-                st.session_state.generated_narratives = "parse_error"
+                # Try fixing trailing commas
+                try:
+                    fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+                    json_match = re.search(r'\[[\s\S]*\]', fixed)
+                    if json_match:
+                        st.session_state.generated_narratives = json.loads(json_match.group())
+                    else:
+                        st.session_state.generated_narratives = "parse_error"
+                except json.JSONDecodeError:
+                    st.session_state.generated_narratives = "parse_error"
 
         st.rerun()
 
@@ -1314,14 +1441,11 @@ def step_generate():
                         if sb_result.startswith("__LLM_"):
                             st.error(f"Storyboard generation failed: {sb_result}")
                         else:
-                            try:
-                                json_match = re.search(r'\{[\s\S]*\}', sb_result)
-                                if json_match:
-                                    st.session_state.generated_storyboard = json.loads(json_match.group())
-                                else:
-                                    # Store raw text as fallback
-                                    st.session_state.generated_storyboard = {"raw": sb_result}
-                            except json.JSONDecodeError:
+                            parsed = _parse_json_response(sb_result)
+                            if parsed:
+                                st.session_state.generated_storyboard = parsed
+                            else:
+                                # Store raw text as fallback display
                                 st.session_state.generated_storyboard = {"raw": sb_result}
                         st.rerun()
 
