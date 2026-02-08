@@ -693,7 +693,8 @@ For each concept, provide:
 5. HOOK DESCRIPTION — what the viewer sees/hears in the first 2 seconds
 6. WHY IT WORKS — 1-2 sentences on why this specific concept is right for this specific brand
 
-Return as valid JSON array with objects containing keys: title, human_truth, summary, emotional_arc, hook, rationale
+Return ONLY a raw JSON array (no markdown code fences, no ```json```, no preamble, no explanation). Just the [ ... ] array.
+Each object must have keys: title, human_truth, summary, emotional_arc, hook, rationale
 
 CRITICAL: Do NOT generate generic concepts. No golden hour montages. No slow-motion smiling. No 'beautiful people doing beautiful things.' Each concept must have a specific, surprising, narratively coherent idea that could ONLY work for this brand."""
 
@@ -709,6 +710,15 @@ def generate_full_storyboard(brand_profile: dict, selected_concept: dict) -> str
     else:
         system_prompt = "You are a world-class creative director for short-form brand video."
 
+    # Add explicit JSON formatting instructions to the system prompt
+    system_prompt += """
+
+CRITICAL OUTPUT RULES:
+- Return ONLY a valid JSON object. No markdown code fences. No commentary before or after.
+- Do NOT wrap the response in ```json``` blocks.
+- The response must start with { and end with }
+- All string values must use double quotes and escape internal quotes properly."""
+
     user_msg = f"""Generate a COMPLETE storyboard for this brand and selected narrative concept.
 
 BRAND PROFILE:
@@ -717,23 +727,49 @@ BRAND PROFILE:
 SELECTED NARRATIVE CONCEPT:
 {json.dumps(selected_concept, indent=2)}
 
-Produce the FULL output as specified in the system prompt output format, including:
+Produce a storyboard with:
 - 5 detailed keyframes with timestamps, scene descriptions, camera, lighting, color, emotion, composition
-- Style suffix for NanoBanana Pro consistency
-- 5 complete image generation prompts (one per keyframe)
-- 4 animation/transition prompts for Veo 3.1
+- A style suffix for image generation consistency
+- 5 complete image generation prompts
+- 4 animation/transition prompts
 - Anti-generic audit results
 - Creative director notes
 
-Return as valid JSON with these top-level keys:
-- style_suffix (string)
-- keyframes (array of 5 objects with: timestamp, narrative_beat, scene_description, camera, lighting, color_palette, emotion, text_overlay, product_presence, composition_notes)
-- image_prompts (array of 5 strings)
-- animation_prompts (array of 4 objects with: transition, motion_type, camera_motion, subject_motion, pacing, visual_transition, emotional_trajectory, audio_cue)
-- anti_generic_audit (object with: all_passed boolean, notes string)
-- creative_director_notes (string)"""
+Return ONLY a raw JSON object (no markdown, no code fences, no preamble) with these keys:
+{{
+  "style_suffix": "persistent style string for all keyframes",
+  "keyframes": [
+    {{
+      "timestamp": "0s",
+      "narrative_beat": "HOOK",
+      "scene_description": "...",
+      "camera": "...",
+      "lighting": "...",
+      "color_palette": "...",
+      "emotion": "...",
+      "text_overlay": "none",
+      "product_presence": "...",
+      "composition_notes": "..."
+    }}
+  ],
+  "image_prompts": ["prompt 1", "prompt 2", "prompt 3", "prompt 4", "prompt 5"],
+  "animation_prompts": [
+    {{
+      "transition": "1→2",
+      "motion_type": "...",
+      "camera_motion": "...",
+      "subject_motion": "...",
+      "pacing": "...",
+      "visual_transition": "...",
+      "emotional_trajectory": "...",
+      "audio_cue": "..."
+    }}
+  ],
+  "anti_generic_audit": {{"all_passed": true, "notes": "..."}},
+  "creative_director_notes": "..."
+}}"""
 
-    return call_llm(system_prompt, user_msg, max_tokens=6000)
+    return call_llm(system_prompt, user_msg, max_tokens=8000)
 
 
 # ---------------------------------------------------------------------------
@@ -1431,23 +1467,32 @@ def step_generate():
         if st.session_state.selected_narrative is not None:
             st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
 
-            selected = narratives[st.session_state.selected_narrative]
+            try:
+                selected = narratives[st.session_state.selected_narrative]
+            except (IndexError, TypeError):
+                st.error("Selected concept not found. Try selecting again.")
+                selected = None
 
-            if st.session_state.generated_storyboard is None:
+            if selected and st.session_state.generated_storyboard is None:
                 if st.button("🎬 Generate Full Storyboard & Prompts", key="gen_storyboard", use_container_width=True):
                     with st.spinner("Generating storyboard, keyframe prompts, and animation directions..."):
-                        sb_result = generate_full_storyboard(profile, selected)
+                        try:
+                            sb_result = generate_full_storyboard(profile, selected)
 
-                        if sb_result.startswith("__LLM_"):
-                            st.error(f"Storyboard generation failed: {sb_result}")
-                        else:
-                            parsed = _parse_json_response(sb_result)
-                            if parsed:
-                                st.session_state.generated_storyboard = parsed
+                            if sb_result is None:
+                                st.session_state.generated_storyboard = {"raw": "Error: LLM returned no response."}
+                            elif sb_result.startswith("__LLM_"):
+                                st.session_state.generated_storyboard = {"raw": f"**Error:** {sb_result}"}
                             else:
-                                # Store raw text as fallback display
-                                st.session_state.generated_storyboard = {"raw": sb_result}
-                        st.rerun()
+                                parsed = _parse_json_response(sb_result)
+                                if parsed:
+                                    st.session_state.generated_storyboard = parsed
+                                else:
+                                    # Store raw text as fallback — this still shows the content
+                                    st.session_state.generated_storyboard = {"raw": sb_result}
+                        except Exception as e:
+                            st.session_state.generated_storyboard = {"raw": f"**Error during generation:** {str(e)}"}
+                    st.rerun()
 
             # Display storyboard
             if st.session_state.generated_storyboard:
@@ -1546,6 +1591,14 @@ def step_generate():
                         <div style="color:#888; font-size:0.85rem; margin-top:8px; line-height:1.5;">{sb['creative_director_notes']}</div>
                     </div>
                     """, unsafe_allow_html=True)
+
+                # Regenerate storyboard button
+                st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+                st.markdown('<div class="back-btn">', unsafe_allow_html=True)
+                if st.button("🔄 Regenerate Storyboard", key="regen_storyboard", use_container_width=False):
+                    st.session_state.generated_storyboard = None
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ===========================================================================
