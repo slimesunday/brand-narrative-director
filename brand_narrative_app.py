@@ -843,6 +843,9 @@ def apply_auto_fill(data: dict):
 
     st.session_state.auto_filled = True
     st.session_state.scrape_attempted = True
+
+
+def generate_narrative_concepts(brand_profile: dict) -> str:
     """Generate narrative concepts using the full system prompt."""
     # Load the system prompt
     system_prompt_path = os.path.join(os.path.dirname(__file__), "brand_narrative_system_prompt.md")
