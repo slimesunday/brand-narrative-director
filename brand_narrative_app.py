@@ -569,35 +569,40 @@ def _try_fetch_about_page(base_url: str) -> str:
     return ""
 
 
-def _parse_json_response(text: str) -> dict | None:
-    """Robustly parse JSON from an LLM response, handling markdown fences and preamble."""
+def _parse_json_response(text: str) -> dict | list | None:
+    """Parse JSON from an LLM response — matches the proven Synth.Human pattern."""
     if not text:
         return None
 
-    # Strip markdown code fences (```json ... ``` or ``` ... ```)
-    cleaned = re.sub(r'```(?:json)?\s*', '', text)
-    cleaned = cleaned.strip()
+    json_str = text.strip()
 
-    # Try direct parse first
+    # Strip markdown code fences (the main culprit with OpenAI models)
+    if "```json" in json_str:
+        json_str = json_str.split("```json")[1].split("```")[0]
+    elif "```" in json_str:
+        json_str = json_str.split("```")[1].split("```")[0]
+
+    json_str = json_str.strip()
+
+    # Try direct parse
     try:
-        return json.loads(cleaned)
+        return json.loads(json_str)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting the first complete JSON object
-    try:
-        match = re.search(r'\{[\s\S]*\}', cleaned)
-        if match:
-            return json.loads(match.group())
-    except json.JSONDecodeError:
-        pass
+    # Try extracting JSON object or array
+    for pattern in [r'\{[\s\S]*\}', r'\[[\s\S]*\]']:
+        try:
+            match = re.search(pattern, json_str)
+            if match:
+                return json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
 
-    # Try fixing common issues: trailing commas
+    # Try fixing trailing commas
     try:
-        fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
-        match = re.search(r'\{[\s\S]*\}', fixed)
-        if match:
-            return json.loads(match.group())
+        fixed = re.sub(r',\s*([}\]])', r'\1', json_str)
+        return json.loads(fixed)
     except json.JSONDecodeError:
         pass
 
@@ -905,12 +910,16 @@ def step_brand_identity():
         if not st.session_state.scrape_attempted:
             if st.button("🔍 Research this brand", key="scrape_btn", use_container_width=False):
                 with st.spinner("Researching brand..."):
-                    data = scrape_brand_info(
-                        st.session_state.brand_name,
-                        st.session_state.brand_url,
-                        st.session_state.brand_category,
-                    )
-                    st.session_state.scraped_data = data
+                    try:
+                        data = scrape_brand_info(
+                            st.session_state.brand_name,
+                            st.session_state.brand_url,
+                            st.session_state.brand_category,
+                        )
+                        st.session_state.scraped_data = data
+                    except Exception as e:
+                        st.error(f"Research failed: {e}")
+                        st.session_state.scraped_data = None
                     st.session_state.scrape_attempted = True
                     st.rerun()
 
@@ -1332,73 +1341,36 @@ def step_generate():
         </div>
         """, unsafe_allow_html=True)
 
-        result = generate_narrative_concepts(profile)
+        try:
+            result = generate_narrative_concepts(profile)
+        except Exception as e:
+            st.error(f"LLM call failed: {e}")
+            st.stop()
 
         if result.startswith("__LLM_"):
-            st.session_state.generated_narratives = "error"
-            st.error(f"LLM integration issue: {result}. Make sure ANTHROPIC_API_KEY is set.")
-            # Generate mock concepts for UI demo
-            st.session_state.generated_narratives = [
-                {
-                    "title": "The Unfinished Text",
-                    "human_truth": "People are motivated by connection, but they experience the anxiety of not knowing how to express what they feel — creating a tension that a small, colorful object on your wrist can resolve by saying what you can't.",
-                    "summary": "A woman types and deletes a text message three times, then looks down at the bracelet her friend gave her, smiles, and sends just a photo of her wrist.",
-                    "emotional_arc": "Hesitation → Recognition → Warmth",
-                    "hook": "Extreme close-up of a thumb deleting a half-typed message. The screen glow reflects off colorful bracelets.",
-                    "rationale": "Specific to digital communication anxiety, visually driven by the phone-bracelet interplay, and the product appears naturally without being showcased."
-                },
-                {
-                    "title": "The Trade",
-                    "human_truth": "People are motivated by the desire to be generous, but they experience the awkwardness of giving gifts that feel too serious — creating a tension that playful, stackable jewelry resolves by making generosity feel effortless.",
-                    "summary": "Two friends at a café silently swap bracelets off their wrists mid-conversation without breaking eye contact or pausing their chat — like it's the most natural thing in the world.",
-                    "emotional_arc": "Casual intimacy → Surprise (for viewer) → Delight",
-                    "hook": "Mid-conversation, a hand reaches across a café table and starts sliding a bracelet off the other person's wrist. No context yet.",
-                    "rationale": "The swap is unexpected and visually compelling, the product appears organically, and it captures the brand's ethos of sharing and connection."
-                },
-                {
-                    "title": "Every Color Was a Day",
-                    "human_truth": "People are motivated by wanting to remember the good moments, but they experience the sadness of time passing — creating a tension that wearable color resolves by turning memories into something tangible on your body.",
-                    "summary": "Quick cuts of a woman adding one new bracelet per scene as seasons change outside the same window — winter coat, spring rain, summer bare arms, fall sweater — until her wrist is a full colorful stack.",
-                    "emotional_arc": "Solitude → Accumulation → Fullness",
-                    "hook": "A bare wrist against a frosted window. One bracelet clicks on. Hard cut to the same wrist, same window — but it's spring.",
-                    "rationale": "Time compression in 10 seconds is visually satisfying, the product accumulation mirrors the brand's stacking aesthetic, and the emotional arc is about life lived rather than product acquired."
-                },
-            ]
-        else:
-            try:
-                # Strip markdown fences first
-                cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
-                # Try array extraction
-                json_match = re.search(r'\[[\s\S]*\]', cleaned)
-                if json_match:
-                    st.session_state.generated_narratives = json.loads(json_match.group())
-                else:
-                    # Maybe it returned a single object — wrap it
-                    parsed = _parse_json_response(cleaned)
-                    if parsed and isinstance(parsed, dict):
-                        st.session_state.generated_narratives = [parsed]
-                    else:
-                        st.session_state.generated_narratives = "parse_error"
-            except json.JSONDecodeError:
-                # Try fixing trailing commas
-                try:
-                    fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
-                    json_match = re.search(r'\[[\s\S]*\]', fixed)
-                    if json_match:
-                        st.session_state.generated_narratives = json.loads(json_match.group())
-                    else:
-                        st.session_state.generated_narratives = "parse_error"
-                except json.JSONDecodeError:
-                    st.session_state.generated_narratives = "parse_error"
+            st.error(f"LLM integration issue: {result}")
+            st.stop()
+
+        # Parse the JSON response
+        try:
+            parsed = _parse_json_response(result)
+            if isinstance(parsed, list):
+                st.session_state.generated_narratives = parsed
+            elif isinstance(parsed, dict):
+                st.session_state.generated_narratives = [parsed]
+            else:
+                st.error("Could not parse narrative concepts. Raw response:")
+                st.code(result[:2000], language=None)
+                st.stop()
+        except Exception as e:
+            st.error(f"JSON parsing failed: {e}")
+            st.code(result[:2000], language=None)
+            st.stop()
 
         st.rerun()
 
     # --- Display concepts ---
     narratives = st.session_state.generated_narratives
-
-    if narratives == "parse_error":
-        st.error("Failed to parse LLM response. Showing fallback concepts.")
-        narratives = []
 
     if isinstance(narratives, list) and len(narratives) > 0:
         for i, concept in enumerate(narratives):
@@ -1475,23 +1447,31 @@ def step_generate():
 
             if selected and st.session_state.generated_storyboard is None:
                 if st.button("🎬 Generate Full Storyboard & Prompts", key="gen_storyboard", use_container_width=True):
-                    with st.spinner("Generating storyboard, keyframe prompts, and animation directions..."):
+                    # Step 1: Call LLM
+                    with st.spinner("Generating storyboard (this may take 30-60 seconds)..."):
                         try:
                             sb_result = generate_full_storyboard(profile, selected)
-
-                            if sb_result is None:
-                                st.session_state.generated_storyboard = {"raw": "Error: LLM returned no response."}
-                            elif sb_result.startswith("__LLM_"):
-                                st.session_state.generated_storyboard = {"raw": f"**Error:** {sb_result}"}
-                            else:
-                                parsed = _parse_json_response(sb_result)
-                                if parsed:
-                                    st.session_state.generated_storyboard = parsed
-                                else:
-                                    # Store raw text as fallback — this still shows the content
-                                    st.session_state.generated_storyboard = {"raw": sb_result}
                         except Exception as e:
-                            st.session_state.generated_storyboard = {"raw": f"**Error during generation:** {str(e)}"}
+                            st.error(f"LLM call failed: {e}")
+                            st.stop()
+
+                    # Step 2: Check for LLM errors
+                    if sb_result is None or sb_result.startswith("__LLM_"):
+                        st.error(f"Storyboard generation failed: {sb_result}")
+                        st.stop()
+
+                    # Step 3: Parse JSON
+                    try:
+                        parsed = _parse_json_response(sb_result)
+                        if parsed:
+                            st.session_state.generated_storyboard = parsed
+                        else:
+                            # JSON parse failed — show raw response so user can see what happened
+                            st.session_state.generated_storyboard = {"raw": sb_result}
+                    except Exception as e:
+                        st.error(f"JSON parsing failed: {e}")
+                        st.session_state.generated_storyboard = {"raw": sb_result}
+
                     st.rerun()
 
             # Display storyboard
