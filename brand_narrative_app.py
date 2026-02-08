@@ -487,8 +487,8 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
 
     client = openai.OpenAI(api_key=api_key)
 
-    # o-series models use a different parameter structure
-    is_reasoning = model.startswith("o")
+    # GPT-5.x and o-series are reasoning models — use developer role + reasoning effort
+    is_reasoning = model.startswith("o") or model.startswith("gpt-5")
 
     if is_reasoning:
         response = client.chat.completions.create(
@@ -497,8 +497,10 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
                 {"role": "developer", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
+            reasoning={"effort": "high"},
         )
     else:
+        # GPT-4.x and older
         response = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
