@@ -349,6 +349,8 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 DEFAULTS = {
     "current_step": 1,
+    "return_to_review": False,
+    "auto_filled": False,
     # LLM Settings
     "llm_provider": "Anthropic",
     "llm_model": "claude-sonnet-4-20250514",
@@ -479,7 +481,7 @@ def _call_anthropic(system_prompt: str, user_message: str, model: str, api_key: 
 
 
 def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int) -> str:
-    """Call OpenAI API (GPT models + o-series)."""
+    """Call OpenAI API (GPT-4.x, GPT-5.x, and o-series)."""
     try:
         import openai
     except ImportError:
@@ -487,7 +489,7 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
 
     client = openai.OpenAI(api_key=api_key)
 
-    # GPT-5.x and o-series are reasoning models — use developer role + reasoning effort
+    # GPT-5.x and o-series are reasoning models
     is_reasoning = model.startswith("o") or model.startswith("gpt-5")
 
     if is_reasoning:
@@ -497,10 +499,11 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
                 {"role": "developer", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            reasoning={"effort": "high"},
+            reasoning_effort="high",              # bare string for Chat Completions API
+            max_completion_tokens=max_tokens,     # NOT max_tokens — reasoning models reject it
         )
     else:
-        # GPT-4.x and older
+        # GPT-4.x and older non-reasoning models
         response = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
@@ -673,7 +676,173 @@ If you know this brand, provide detailed information. If you don't recognize it,
     return parsed
 
 
-def generate_narrative_concepts(brand_profile: dict) -> str:
+def auto_fill_all_fields(brand_name: str, url: str, category: str, scraped_data: dict = None) -> dict:
+    """Use LLM to auto-fill every wizard field based on brand research."""
+
+    # Gather site content if available
+    site_text = ""
+    about_text = ""
+    if url:
+        site_text = _fetch_website_text(url)
+        about_text = _try_fetch_about_page(url)
+
+    scraped_context = ""
+    if scraped_data:
+        scraped_context = f"\n=== PREVIOUSLY SCRAPED BRAND DATA ===\n{json.dumps(scraped_data, indent=2)}"
+
+    site_context = ""
+    if len(site_text) > 100:
+        site_context = f"\n=== HOMEPAGE CONTENT ===\n{site_text[:5000]}"
+        if about_text:
+            site_context += f"\n=== ABOUT PAGE CONTENT ===\n{about_text[:3000]}"
+
+    system = """You are an expert brand strategist and creative director. Given a brand, you will fill out a complete creative brief for a 10-12 second brand messaging video.
+
+Return ONLY a valid JSON object — no markdown fences, no commentary, no preamble. Just the raw JSON.
+
+The JSON must have EXACTLY these fields:
+{
+    "brand_description": "1-2 sentence description of the brand — what they make and their vibe",
+    "tagline": "brand tagline or slogan, empty string if unknown",
+    "ethos": "1-2 sentence brand mission/ethos",
+    "values": ["value1", "value2", "value3"],
+    "anti_positioning": "what the brand explicitly is NOT or avoids being",
+    "emotional_territory": "the core feeling/emotion the brand owns",
+    "audience_description": "psychographic description of typical customer — lifestyle, not demographics",
+    "aesthetic_description": "visual style, color tendencies, design language",
+    "price_tier": "budget / accessible / mid-range / premium / luxury",
+    "audience_lifestyle": "2-3 sentence psychographic portrait of the ideal customer — what they care about, how they discover brands, their relationship with the product category",
+    "adjacent_brands": "3-5 brands the customer also loves, comma-separated",
+    "platform": "Instagram Reels or TikTok or YouTube Shorts",
+    "personality_exclusive_accessible": 50,
+    "personality_serious_playful": 50,
+    "personality_minimal_expressive": 50,
+    "personality_classic_trendy": 50,
+    "personality_loud_quiet": 50,
+    "personality_luxury_everyday": 50,
+    "emotion_feel_after": "2-3 sentences describing how someone should feel after watching the video — be specific and evocative, not generic",
+    "emotion_reject": "1-2 sentences describing the feelings/vibes the brand explicitly rejects",
+    "emotion_movie_scene": "A specific movie scene description — if this brand were a moment in a film, what would be happening? Be concrete and visual, not abstract",
+    "visual_styles": ["id1", "id2"],
+    "color_primary": "#hexcode",
+    "color_secondary": "#hexcode",
+    "color_accent": "#hexcode",
+    "product_presence": "None — no product visible at all | Ambient — worn/used naturally, never the focus | Visible — clearly present but story-first",
+    "text_overlay": "None — visuals only | Tagline at end only | Minimal text throughout (3-7 words max per overlay) | Text-heavy / typographic style",
+    "audio_direction": "genre, mood, voiceover preference — be specific",
+    "confidence": "high / medium / low"
+}
+
+PERSONALITY SLIDERS: Each is 0-100 where 0 is the first trait and 100 is the second trait. 
+- exclusive_accessible: 0=very exclusive, 100=very accessible
+- serious_playful: 0=very serious, 100=very playful
+- minimal_expressive: 0=very minimal, 100=very expressive
+- classic_trendy: 0=very classic, 100=very trendy
+- loud_quiet: 0=very loud, 100=very quiet
+- luxury_everyday: 0=very luxury, 100=very everyday
+
+VISUAL STYLES: Pick 2-4 from: cinematic, documentary, editorial, surreal, lofi, minimal, maximalist, vintage, neon, organic, graphic, luxe
+
+COLOR PALETTE: Extract actual brand colors from the website content if possible. Use hex codes.
+
+PRODUCT PRESENCE: Pick exactly one of the three options listed.
+TEXT OVERLAY: Pick exactly one of the four options listed.
+
+MOVIE SCENE: This is the most important creative field. Be SPECIFIC and CINEMATIC — describe a concrete scene with setting, action, characters, mood. Not abstract feelings, but what you'd actually SEE on screen.
+
+CRITICAL: Return ONLY the JSON object. No other text before or after it."""
+
+    user_msg = f"""Fill out a complete creative brief for this brand:
+
+Brand: {brand_name}
+Website: {url}
+Category: {category}
+{scraped_context}
+{site_context}
+
+Be specific, creative, and insightful. Avoid generic filler. Every field should feel like it was written by someone who deeply understands this brand."""
+
+    result = call_llm(system, user_msg, max_tokens=3000)
+
+    if result.startswith("__LLM_"):
+        return None
+
+    parsed = _parse_json_response(result)
+    return parsed
+
+
+def apply_auto_fill(data: dict):
+    """Apply auto-filled data to session state."""
+    if not data:
+        return
+
+    # Brand identity
+    if data.get("brand_description"):
+        st.session_state.brand_description = data["brand_description"]
+
+    # Store scraped-style data
+    st.session_state.scraped_data = {
+        "tagline": data.get("tagline", ""),
+        "ethos": data.get("ethos", ""),
+        "values": data.get("values", []),
+        "anti_positioning": data.get("anti_positioning", ""),
+        "emotional_territory": data.get("emotional_territory", ""),
+        "audience_description": data.get("audience_description", ""),
+        "aesthetic_description": data.get("aesthetic_description", ""),
+        "price_tier": data.get("price_tier", ""),
+        "confidence": data.get("confidence", "medium"),
+    }
+
+    # Audience
+    if data.get("audience_lifestyle"):
+        st.session_state.audience_lifestyle = data["audience_lifestyle"]
+    if data.get("adjacent_brands"):
+        st.session_state.audience_brands = data["adjacent_brands"]
+    if data.get("platform"):
+        st.session_state.audience_platform = data["platform"]
+
+    # Personality sliders
+    for key in ["personality_exclusive_accessible", "personality_serious_playful",
+                "personality_minimal_expressive", "personality_classic_trendy",
+                "personality_loud_quiet", "personality_luxury_everyday"]:
+        if key in data and isinstance(data[key], (int, float)):
+            st.session_state[key] = max(0, min(100, int(data[key])))
+
+    # Emotional territory
+    if data.get("emotion_feel_after"):
+        st.session_state.emotion_feel_after = data["emotion_feel_after"]
+    if data.get("emotion_reject"):
+        st.session_state.emotion_reject = data["emotion_reject"]
+    if data.get("emotion_movie_scene"):
+        st.session_state.emotion_movie_scene = data["emotion_movie_scene"]
+
+    # Visual direction
+    if data.get("visual_styles") and isinstance(data["visual_styles"], list):
+        valid_ids = [s["id"] for s in VISUAL_STYLES]
+        st.session_state.visual_selections = [v for v in data["visual_styles"] if v in valid_ids]
+    if data.get("color_primary"):
+        st.session_state.color_primary = data["color_primary"]
+    if data.get("color_secondary"):
+        st.session_state.color_secondary = data["color_secondary"]
+    if data.get("color_accent"):
+        st.session_state.color_accent = data["color_accent"]
+
+    # Production
+    if data.get("product_presence"):
+        for opt in PRODUCT_PRESENCE_OPTIONS:
+            if data["product_presence"].lower() in opt.lower():
+                st.session_state.product_in_frame = opt
+                break
+    if data.get("text_overlay"):
+        for opt in TEXT_OVERLAY_OPTIONS:
+            if data["text_overlay"].lower() in opt.lower():
+                st.session_state.text_overlay_pref = opt
+                break
+    if data.get("audio_direction"):
+        st.session_state.audio_direction = data["audio_direction"]
+
+    st.session_state.auto_filled = True
+    st.session_state.scrape_attempted = True
     """Generate narrative concepts using the full system prompt."""
     # Load the system prompt
     system_prompt_path = os.path.join(os.path.dirname(__file__), "brand_narrative_system_prompt.md")
@@ -812,9 +981,25 @@ def render_step_header(step_num: int, title: str, subtitle: str):
 
 
 def nav_buttons(back=True, next_label="Continue", next_disabled=False):
-    """Render navigation buttons."""
-    cols = st.columns([1, 1, 3]) if back else st.columns([1, 4])
-    if back:
+    """Render navigation buttons. Shows 'Back to Review' when editing from review."""
+    is_editing = st.session_state.return_to_review
+
+    if is_editing:
+        # Editing mode: show Back to Review instead of normal nav
+        cols = st.columns([1, 1, 3])
+        with cols[0]:
+            st.markdown('<div class="back-btn">', unsafe_allow_html=True)
+            if st.button("← Back", key=f"back_{st.session_state.current_step}", use_container_width=True):
+                st.session_state.current_step -= 1
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+        with cols[1]:
+            if st.button("✓ Back to Review", key=f"review_{st.session_state.current_step}", use_container_width=True):
+                st.session_state.current_step = 6
+                st.session_state.return_to_review = False
+                st.rerun()
+    elif back:
+        cols = st.columns([1, 1, 3])
         with cols[0]:
             st.markdown('<div class="back-btn">', unsafe_allow_html=True)
             if st.button("← Back", key=f"back_{st.session_state.current_step}", use_container_width=True):
@@ -826,6 +1011,7 @@ def nav_buttons(back=True, next_label="Continue", next_disabled=False):
                 st.session_state.current_step += 1
                 st.rerun()
     else:
+        cols = st.columns([1, 4])
         with cols[0]:
             if st.button(next_label, key=f"next_{st.session_state.current_step}", disabled=next_disabled, use_container_width=True):
                 st.session_state.current_step += 1
@@ -878,7 +1064,7 @@ TEXT_OVERLAY_OPTIONS = [
 # STEP 1: BRAND IDENTITY
 # ===========================================================================
 def step_brand_identity():
-    render_step_header(1, "Who's the brand?", "Start with the basics. If the brand has a web presence, we'll pull what we can.")
+    render_step_header(1, "Who's the brand?", "Start with the basics. If the brand has a web presence, we can auto-fill everything.")
 
     st.session_state.brand_name = st.text_input(
         "Brand name",
@@ -905,26 +1091,51 @@ def step_brand_identity():
         height=100,
     )
 
-    # --- Auto-scrape section ---
-    if st.session_state.brand_name and st.session_state.brand_category:
+    # --- Auto-fill section ---
+    can_research = bool(st.session_state.brand_name and st.session_state.brand_category)
+
+    if can_research:
         st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
 
-        if not st.session_state.scrape_attempted:
-            if st.button("🔍 Research this brand", key="scrape_btn", use_container_width=False):
-                with st.spinner("Researching brand..."):
+        col1, col2 = st.columns(2)
+        with col1:
+            # Full auto-fill: research + fill all fields + jump to review
+            if st.button("🚀 Research & Auto-Fill Everything", key="autofill_btn", use_container_width=True):
+                with st.spinner("Researching brand and filling all fields... (this may take 30-60 seconds)"):
                     try:
-                        data = scrape_brand_info(
+                        data = auto_fill_all_fields(
                             st.session_state.brand_name,
                             st.session_state.brand_url,
                             st.session_state.brand_category,
                         )
-                        st.session_state.scraped_data = data
+                        if data:
+                            apply_auto_fill(data)
+                            st.session_state.current_step = 6  # Jump to review
+                            st.rerun()
+                        else:
+                            st.error("Auto-fill failed — could not parse LLM response. Try the manual flow instead.")
                     except Exception as e:
-                        st.error(f"Research failed: {e}")
-                        st.session_state.scraped_data = None
-                    st.session_state.scrape_attempted = True
-                    st.rerun()
+                        st.error(f"Auto-fill failed: {e}")
 
+        with col2:
+            # Research only: just populate scraped_data, stay on page
+            if not st.session_state.scrape_attempted:
+                if st.button("🔍 Research only (manual fill)", key="scrape_btn", use_container_width=True):
+                    with st.spinner("Researching brand..."):
+                        try:
+                            data = scrape_brand_info(
+                                st.session_state.brand_name,
+                                st.session_state.brand_url,
+                                st.session_state.brand_category,
+                            )
+                            st.session_state.scraped_data = data
+                        except Exception as e:
+                            st.error(f"Research failed: {e}")
+                            st.session_state.scraped_data = None
+                        st.session_state.scrape_attempted = True
+                        st.rerun()
+
+        # Show scraped data preview if available
         if st.session_state.scraped_data:
             d = st.session_state.scraped_data
             confidence = d.get("confidence", "unknown")
@@ -955,14 +1166,16 @@ def step_brand_identity():
             </div>
             """, unsafe_allow_html=True)
 
-            st.markdown('<div class="info-box">Review the research above. You\'ll be able to refine everything in the following steps. This gives us a head start.</div>', unsafe_allow_html=True)
+            if st.session_state.auto_filled:
+                st.markdown('<div class="info-box">✓ All fields auto-filled. Review everything on the next page.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="info-box">Research complete. Continue to fill in the remaining fields manually, or click "Research & Auto-Fill Everything" to fill them all at once.</div>', unsafe_allow_html=True)
 
         elif st.session_state.scrape_attempted:
             st.markdown('<div class="info-box">Could not auto-research this brand. No worries — we\'ll build the profile manually in the next steps.</div>', unsafe_allow_html=True)
 
     st.markdown("")  # spacer
-    can_proceed = bool(st.session_state.brand_name and st.session_state.brand_category)
-    nav_buttons(back=False, next_label="Continue →", next_disabled=not can_proceed)
+    nav_buttons(back=False, next_label="Continue → (manual fill)", next_disabled=not can_research)
 
 
 # ===========================================================================
@@ -1243,7 +1456,7 @@ def build_brand_profile() -> dict:
 
 
 def step_review():
-    render_step_header(6, "Review your brand profile", "This is what we'll feed to the narrative engine. Edit anything that's off.")
+    render_step_header(6, "Review your brand profile", "This is what we'll feed to the narrative engine. Click Edit on any section to refine it.")
 
     profile = build_brand_profile()
     st.session_state.brand_profile_json = profile
@@ -1266,9 +1479,9 @@ def step_review():
     </div>
     """, unsafe_allow_html=True)
 
-    # Display profile sections
+    # Section definitions: (section_name, edit_step, fields)
     sections = [
-        ("IDENTITY", [
+        ("IDENTITY", 1, [
             ("Brand", profile["brand_name"]),
             ("Category", profile["category"]),
             ("Description", profile["description"]),
@@ -1279,18 +1492,18 @@ def step_review():
             ("Emotional Territory", profile["identity"]["emotional_territory"]),
             ("Price Tier", profile["identity"]["price_tier"]),
         ]),
-        ("AUDIENCE", [
+        ("AUDIENCE", 2, [
             ("Lifestyle", profile["audience"]["lifestyle"]),
             ("Adjacent Brands", profile["audience"]["adjacent_brands"]),
             ("Platform", profile["audience"]["primary_platform"]),
         ]),
-        ("PERSONALITY", [(k.replace("_vs_", " vs ").replace("_", " ").title(), v) for k, v in profile["personality"].items()]),
-        ("EMOTIONAL DIRECTION", [
+        ("PERSONALITY", 3, [(k.replace("_vs_", " vs ").replace("_", " ").title(), v) for k, v in profile["personality"].items()]),
+        ("EMOTIONAL DIRECTION", 4, [
             ("Desired Feeling", profile["emotional_direction"]["desired_feeling"]),
             ("Rejected Feeling", profile["emotional_direction"]["rejected_feeling"]),
             ("Movie Scene", profile["emotional_direction"]["movie_scene"]),
         ]),
-        ("VISUAL & PRODUCTION", [
+        ("VISUAL & PRODUCTION", 5, [
             ("Visual Styles", ", ".join(profile["visual_direction"]["styles"]) if profile["visual_direction"]["styles"] else "—"),
             ("Colors", f'Primary: {profile["visual_direction"]["color_palette"]["primary"]} | Secondary: {profile["visual_direction"]["color_palette"]["secondary"]} | Accent: {profile["visual_direction"]["color_palette"]["accent"]}'),
             ("Product Presence", profile["production"]["product_presence"]),
@@ -1300,8 +1513,24 @@ def step_review():
         ]),
     ]
 
-    for section_name, fields in sections:
-        st.markdown(f'<div class="scraped-label" style="margin-top:20px; margin-bottom:12px; font-size:0.7rem;">{section_name}</div>', unsafe_allow_html=True)
+    for section_name, edit_step, fields in sections:
+        # Section header with Edit button
+        header_cols = st.columns([5, 1])
+        with header_cols[0]:
+            st.markdown(f'<div class="scraped-label" style="margin-top:20px; margin-bottom:12px; font-size:0.7rem;">{section_name}</div>', unsafe_allow_html=True)
+        with header_cols[1]:
+            st.markdown('<div class="back-btn" style="margin-top:16px;">', unsafe_allow_html=True)
+            if st.button("✏️ Edit", key=f"edit_{section_name}", use_container_width=True):
+                st.session_state.return_to_review = True
+                st.session_state.current_step = edit_step
+                # Clear generated content since profile is being modified
+                st.session_state.generated_narratives = None
+                st.session_state.selected_narrative = None
+                st.session_state.generated_storyboard = None
+                st.session_state.brand_profile_json = None
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
         for label, value in fields:
             if value and value != "—":
                 st.markdown(f"""
