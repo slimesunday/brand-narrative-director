@@ -441,7 +441,7 @@ TOTAL_STEPS = 7  # Identity, Audience, Personality, Emotion, Visual, Review, Gen
 # ---------------------------------------------------------------------------
 # HELPER: LLM INTEGRATION (Multi-provider)
 # ---------------------------------------------------------------------------
-def call_llm(system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+def call_llm(system_prompt: str, user_message: str, max_tokens: int = 4096, web_search: bool = False) -> str:
     """Route LLM calls to the selected provider and model."""
     provider = st.session_state.get("llm_provider", "Anthropic")
     model = st.session_state.get("llm_model", "claude-sonnet-4-20250514")
@@ -452,35 +452,47 @@ def call_llm(system_prompt: str, user_message: str, max_tokens: int = 4096) -> s
 
     try:
         if provider == "Anthropic":
-            return _call_anthropic(system_prompt, user_message, model, api_key, max_tokens)
+            return _call_anthropic(system_prompt, user_message, model, api_key, max_tokens, web_search)
         elif provider == "OpenAI":
-            return _call_openai(system_prompt, user_message, model, api_key, max_tokens)
+            return _call_openai(system_prompt, user_message, model, api_key, max_tokens, web_search)
         elif provider == "Google":
-            return _call_google(system_prompt, user_message, model, api_key, max_tokens)
+            return _call_google(system_prompt, user_message, model, api_key, max_tokens, web_search)
         else:
             return f"__LLM_ERROR__: Unknown provider {provider}"
     except Exception as e:
         return f"__LLM_ERROR__: {str(e)}"
 
 
-def _call_anthropic(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int) -> str:
-    """Call Anthropic Claude API."""
+def _call_anthropic(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int, web_search: bool = False) -> str:
+    """Call Anthropic Claude API with optional web search."""
     try:
         import anthropic
     except ImportError:
         return "__LLM_ERROR__: `anthropic` package not installed. Run: pip install anthropic"
 
     client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    return response.content[0].text
+
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+
+    if web_search:
+        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+
+    response = client.messages.create(**kwargs)
+
+    # Extract text from response — may have multiple content blocks when web search is used
+    text_parts = []
+    for block in response.content:
+        if hasattr(block, "text"):
+            text_parts.append(block.text)
+    return "\n".join(text_parts) if text_parts else response.content[0].text
 
 
-def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int) -> str:
+def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int, web_search: bool = False) -> str:
     """Call OpenAI API (GPT-4.x, GPT-5.x, and o-series)."""
     try:
         import openai
@@ -492,6 +504,21 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
     # GPT-5.x and o-series are reasoning models
     is_reasoning = model.startswith("o") or model.startswith("gpt-5")
 
+    # Web search requires the Responses API
+    if web_search:
+        kwargs = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": user_message,
+            "tools": [{"type": "web_search"}],
+            "max_output_tokens": max_tokens,
+        }
+        if is_reasoning:
+            kwargs["reasoning"] = {"effort": "high"}
+        response = client.responses.create(**kwargs)
+        return response.output_text
+
+    # Standard Chat Completions API (no web search)
     if is_reasoning:
         response = client.chat.completions.create(
             model=model,
@@ -515,21 +542,31 @@ def _call_openai(system_prompt: str, user_message: str, model: str, api_key: str
     return response.choices[0].message.content
 
 
-def _call_google(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int) -> str:
-    """Call Google Gemini API."""
+def _call_google(system_prompt: str, user_message: str, model: str, api_key: str, max_tokens: int, web_search: bool = False) -> str:
+    """Call Google Gemini API with optional Google Search grounding."""
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         return "__LLM_ERROR__: `google-genai` package not installed. Run: pip install google-genai"
 
     client = genai.Client(api_key=api_key)
+
+    config_kwargs = {
+        "system_instruction": system_prompt,
+        "max_output_tokens": max_tokens,
+    }
+
+    tools = []
+    if web_search:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if tools:
+        config_kwargs["tools"] = tools
+
     response = client.models.generate_content(
         model=model,
         contents=user_message,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
     return response.text
 
@@ -628,6 +665,7 @@ def scrape_brand_info(brand_name: str, url: str, category: str) -> dict:
 
     # --- Step 2: Build the LLM prompt based on what we have ---
     system = """You are a brand research analyst. Your job is to produce a structured brand profile.
+You have access to web search. ALWAYS search the web for the brand's website and any relevant information before producing your profile. Do not rely solely on your training data.
 Return ONLY a valid JSON object — no markdown fences, no commentary, no preamble. Just the raw JSON.
 The JSON must have exactly these fields:
 {
@@ -665,9 +703,9 @@ Brand: {brand_name}
 Website: {url}
 Category: {category}
 
-If you know this brand, provide detailed information. If you don't recognize it, set confidence to 'low' and make reasonable inferences based on the category and name."""
+IMPORTANT: Only provide information you are CERTAIN about from your training data. If you do not confidently know this specific brand, set ALL text fields to empty strings, set values to an empty array, set confidence to 'low', and set notable_info to 'Brand not found in training data — website could not be scraped. Manual input recommended.' Do NOT invent or guess a brand identity."""
 
-    result = call_llm(system, user_msg, max_tokens=1024)
+    result = call_llm(system, user_msg, max_tokens=1024, web_search=True)
 
     if result.startswith("__LLM_"):
         return None
@@ -697,6 +735,8 @@ def auto_fill_all_fields(brand_name: str, url: str, category: str, scraped_data:
             site_context += f"\n=== ABOUT PAGE CONTENT ===\n{about_text[:3000]}"
 
     system = """You are an expert brand strategist and creative director. Given a brand, you will fill out a complete creative brief for a 10-12 second brand messaging video.
+
+You have access to web search. ALWAYS search the web for the brand's website, social media, and any press or reviews before filling out the brief. Use real information from the web — do not guess or invent brand details.
 
 Return ONLY a valid JSON object — no markdown fences, no commentary, no preamble. Just the raw JSON.
 
@@ -760,9 +800,11 @@ Category: {category}
 {scraped_context}
 {site_context}
 
+Search the brand's website and social media to find real information. Extract actual brand colors, voice, audience, and aesthetic from what you find online. Every field should be based on real brand data, not guesses.
+
 Be specific, creative, and insightful. Avoid generic filler. Every field should feel like it was written by someone who deeply understands this brand."""
 
-    result = call_llm(system, user_msg, max_tokens=3000)
+    result = call_llm(system, user_msg, max_tokens=3000, web_search=True)
 
     if result.startswith("__LLM_"):
         return None
@@ -1112,7 +1154,11 @@ def step_brand_identity():
                             st.session_state.brand_category,
                         )
                         if data:
+                            confidence = data.get("confidence", "low")
                             apply_auto_fill(data)
+                            if confidence == "low":
+                                st.warning("⚠️ Website could not be fully scraped — the AI filled fields based on limited knowledge. Please review carefully on the next page and edit anything that looks off.")
+                                import time as _t; _t.sleep(3)
                             st.session_state.current_step = 6  # Jump to review
                             st.rerun()
                         else:
